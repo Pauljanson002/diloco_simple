@@ -86,7 +86,7 @@ def main(
     )
     tokenizer.pad_token = "</s>"  # Ensure pad token is set for models that need it
 
-    ds = load_dataset("PrimeIntellect/c4-tiny", "en", ignore_verifications=True)
+    ds = load_dataset("PrimeIntellect/c4-tiny", "en",verification_mode="no_checks")
 
     def tokenize_function(data):
         outputs = tokenizer(data["text"], truncation=True, max_length=seq_length)

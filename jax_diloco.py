@@ -136,55 +136,127 @@ def create_padding_mask(targets):
     return jnp.where(targets > 0, 1.0, 0.0)
 
 
+# JIT-compile the loss function for better performance
+@partial(jax.jit, static_argnums=(2,))
+def loss_fn(params, batch, apply_fn, dropout_rng, train=True):
+    """Compute loss and metrics for a batch."""
+    batch_copy = dict(batch)  # Make a copy of the batch to avoid modifying the original
+    labels = batch_copy.pop("labels")
+    padding_mask = create_padding_mask(labels)
+
+    logits = apply_fn(
+        **batch_copy,
+        params=params,
+        dropout_rng=dropout_rng,
+        train=train,
+    )[0]
+
+    # Shift logits and labels for next token prediction
+    shift_logits = logits[:, :-1]
+    shift_labels = labels[:, 1:]
+    shift_padding_mask = padding_mask[:, 1:]
+
+    metrics = compute_metrics(shift_logits, shift_labels, shift_padding_mask)
+    return metrics["loss"], metrics
+
+
+# JIT-compile the parameter update logic - remove static_argnums since gradient_acc_step and gradient_acc_steps are not hashable
+@jax.jit
+def apply_accumulated_gradients(
+    state, accumulated_grads, gradient_acc_step, gradient_acc_steps
+):
+    """Apply accumulated gradients to the model parameters."""
+    # Normalize the accumulated gradients
+    normalized_grads = jax.tree_map(lambda g: g / gradient_acc_steps, accumulated_grads)
+
+    # Clip gradients by global norm
+    clip_threshold = 1.0  # We can make this a parameter if needed
+
+    # Calculate global norm
+    sq_sum = sum(
+        jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(normalized_grads)
+    )
+    global_norm = jnp.sqrt(sq_sum)
+
+    # Calculate the scaling factor for clipping
+    scale = jnp.minimum(1.0, clip_threshold / (global_norm + 1e-6))
+
+    # Apply scaling to all gradients
+    clipped_grads = jax.tree_map(lambda g: g * scale, normalized_grads)
+
+    # Apply the normalized gradients to update the model
+    new_state = state.apply_gradients(grads=clipped_grads)
+
+    # Increment the inner steps counter (each grad acc cycle counts as one step)
+    inner_steps_counter = state.inner_steps_counter + 1
+
+    # Initialize empty gradients with same structure (zeros) instead of None
+    empty_grads = jax.tree_map(lambda x: jnp.zeros_like(x), accumulated_grads)
+
+    # Reset gradient accumulation
+    return new_state.replace(
+        gradient_acc_step=0,
+        accumulated_grads=empty_grads,  # Use empty grads instead of None
+        inner_steps_counter=inner_steps_counter,
+    )
+
+
+# JIT-compile the sync logic
+@jax.jit
+def sync_parameters(new_state, state):
+    """Synchronize parameters with global state."""
+    # Calculate parameter differences between current and last global sync
+    param_diff = jax.tree_map(
+        lambda inner, outer: outer - inner, new_state.params, state.outer_params
+    )
+
+    # Use pmean to average the parameter differences across devices
+    param_diff_mean = jax.lax.pmean(param_diff, axis_name="batch")
+
+    # Create updates for outer optimizer using the maintained outer optimizer state
+    outer_updates, new_outer_opt_state = state.outer_tx.update(
+        param_diff_mean, state.outer_opt_state
+    )
+
+    # Apply the updates to the outer parameters
+    new_outer_params = optax.apply_updates(state.outer_params, outer_updates)
+
+    # Reset inner state to use the new global parameters
+    return new_state.replace(
+        params=new_outer_params,
+        outer_params=new_outer_params,
+        outer_opt_state=new_outer_opt_state,  # Update the outer optimizer state
+        inner_steps_counter=0,  # Reset counter after sync
+    )
+
+
+@partial(jax.jit, donate_argnums=(0,))
 def train_step_single_device(state, batch, dropout_rng):
     """Train for a single step on a single device with low communication."""
     dropout_rng = jax.random.fold_in(dropout_rng, state.step)
 
-    def loss_fn(params):
-        batch_copy = dict(
-            batch
-        )  # Make a copy of the batch to avoid modifying the original
-        labels = batch_copy.pop("labels")
-        padding_mask = create_padding_mask(labels)
+    # Calculate loss and gradients
+    (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+        state.params, batch, state.apply_fn, dropout_rng
+    )
 
-        logits = state.apply_fn(
-            **batch_copy,
-            params=params,
-            dropout_rng=dropout_rng,
-            train=True,
-        )[0]
-
-        # Shift logits and labels for next token prediction
-        shift_logits = logits[:, :-1]
-        shift_labels = labels[:, 1:]
-        shift_padding_mask = padding_mask[:, 1:]
-
-        metrics = compute_metrics(shift_logits, shift_labels, shift_padding_mask)
-        return metrics["loss"], metrics
-
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (_, metrics), grads = grad_fn(state.params)
-
-    # grads = jax.tree_map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
-
-    # Accumulate gradients using jax.lax.cond for traceability
-    def initialize_grads(unused):
+    # Initialize or accumulate gradients
+    def initialize_grads(_):
         return grads
 
     def add_to_existing_grads(existing_grads):
-        # Handle the case where existing_grads is None
         return jax.tree_map(
             lambda acc, g: g if acc is None else acc + g,
-            existing_grads, 
+            existing_grads,
             grads,
-            is_leaf=lambda x: x is None
+            is_leaf=lambda x: x is None,
         )
 
     accumulated_grads = jax.lax.cond(
         state.gradient_acc_step == 0,
         initialize_grads,
         add_to_existing_grads,
-        state.accumulated_grads
+        state.accumulated_grads,
     )
 
     # Increment gradient accumulation step
@@ -193,104 +265,31 @@ def train_step_single_device(state, batch, dropout_rng):
     # Check if we've accumulated enough gradients
     apply_grads = gradient_acc_step >= state.gradient_acc_steps
 
-    # Define the branch where we apply gradients
-    def apply_gradients_branch(args):
-        state, accumulated_grads, gradient_acc_step = args
-
-        # Normalize the accumulated gradients
-        normalized_grads = jax.tree_map(
-            lambda g: g / state.gradient_acc_steps, accumulated_grads
-        )
-        # Clip gradients by global norm
-        clip_threshold = 1.0  # We can make this a parameter if needed
-
-        # Calculate global norm
-        sq_sum = sum(
-            jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(normalized_grads)
-        )
-        global_norm = jnp.sqrt(sq_sum)
-
-        # Calculate the scaling factor for clipping
-        scale = jnp.minimum(1.0, clip_threshold / (global_norm + 1e-6))
-
-        # Apply scaling to all gradients
-        clipped_grads = jax.tree_map(lambda g: g * scale, normalized_grads)
-
-        # Apply the normalized gradients to update the model
-        new_state = state.apply_gradients(grads=clipped_grads)
-
-        # Increment the inner steps counter (each grad acc cycle counts as one step)
-        inner_steps_counter = state.inner_steps_counter + 1
-
-        # Initialize empty gradients with same structure (zeros) instead of None
-        empty_grads = jax.tree_map(lambda x: jnp.zeros_like(x), accumulated_grads)
-
-        # Reset gradient accumulation
-        return new_state.replace(
-            gradient_acc_step=0,
-            accumulated_grads=empty_grads,  # Use empty grads instead of None
-            inner_steps_counter=inner_steps_counter,
-        )
-
-    # Define the branch where we just accumulate gradients
-    def accumulate_gradients_branch(args):
-        state, accumulated_grads, gradient_acc_step = args
-
-        # Update accumulated_grads and gradient_acc_step
-        return state.replace(
-            accumulated_grads=accumulated_grads, gradient_acc_step=gradient_acc_step
-        )
-
-    # Use JAX's conditional to decide whether to apply gradients
+    # Use JAX's conditional to decide whether to apply gradients or just accumulate
     new_state = jax.lax.cond(
         apply_grads,
-        apply_gradients_branch,
-        accumulate_gradients_branch,
-        (state, accumulated_grads, gradient_acc_step),
+        lambda _: apply_accumulated_gradients(
+            state, accumulated_grads, gradient_acc_step, state.gradient_acc_steps
+        ),
+        lambda _: state.replace(
+            accumulated_grads=accumulated_grads, gradient_acc_step=gradient_acc_step
+        ),
+        None,
     )
 
     # Check if we need to synchronize with global parameters
     # Only check after applying gradients (when gradient accumulation is complete)
     needs_sync = jnp.logical_and(
         new_state.gradient_acc_step == 0,
-        new_state.inner_steps_counter >= new_state.inner_steps_max
+        new_state.inner_steps_counter >= new_state.inner_steps_max,
     )
 
-    # Define the two branches for JAX's conditional
-    def sync_branch(args):
-        new_state, state = args
-        # Calculate parameter differences between current and last global sync
-        param_diff = jax.tree_map(
-            lambda inner, outer: outer - inner, new_state.params, state.outer_params
-        )
-
-        # Use pmean to average the parameter differences across devices
-        param_diff_mean = jax.lax.pmean(param_diff, axis_name="batch")
-
-        # Create updates for outer optimizer using the maintained outer optimizer state
-        outer_updates, new_outer_opt_state = state.outer_tx.update(
-            param_diff_mean, state.outer_opt_state
-        )
-
-        # Apply the updates to the outer parameters
-        new_outer_params = optax.apply_updates(state.outer_params, outer_updates)
-
-        # Reset inner state to use the new global parameters
-        return new_state.replace(
-            params=new_outer_params,
-            outer_params=new_outer_params,
-            outer_opt_state=new_outer_opt_state,  # Update the outer optimizer state
-            inner_steps_counter=0,  # Reset counter after sync
-        )
-
-    def no_sync_branch(args):
-        new_state, _ = args
-        # No sync needed
-        return new_state
-
-    # Use JAX's conditional instead of Python if
+    # Use JAX's conditional for sync decision
     new_state = jax.lax.cond(
-        needs_sync, sync_branch, no_sync_branch, (new_state, state)
+        needs_sync,
+        lambda _: sync_parameters(new_state, state),
+        lambda _: new_state,
+        None,
     )
 
     return new_state, metrics, dropout_rng, needs_sync
@@ -306,8 +305,7 @@ def train_step(state, batch, dropout_rng):
     # All-reduce metrics across devices
     metrics = jax.lax.pmean(metrics, axis_name="batch")
 
-    # Synchronize the needs_sync flag across devices with psum - all devices sync if any need to sync
-    # Using psum to count how many devices need sync, then checking if any do
+    # Synchronize the needs_sync flag across devices
     needs_sync = jax.lax.pmin(needs_sync, axis_name="batch")
 
     return new_state, metrics, dropout_rng, needs_sync
@@ -363,7 +361,7 @@ def main(
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     print(f"Total batch size: {batch_size}")
     print(f"Inner steps before synchronization: {inner_steps}")
-    
+
     if jax.process_index() == 0:
         wandb.init(project="diloco", config=locals())
 
@@ -411,7 +409,11 @@ def main(
 
     # Create training state and replicate across devices
     state = create_low_comm_train_state(
-        model, inner_optimizer, outer_optimizer, inner_steps,gradient_acc_steps=gradient_accumulation_steps
+        model,
+        inner_optimizer,
+        outer_optimizer,
+        inner_steps,
+        gradient_acc_steps=gradient_accumulation_steps,
     )
     state = flax.jax_utils.replicate(state)
 
@@ -508,7 +510,9 @@ def main(
             # Only print sync message from the first device (host_id 0)
             if did_sync.all() and jax.process_index() == 0:
                 sync_count += 1
-                print(f"Global synchronization completed (sync #{sync_count}) at step {global_step}")
+                print(
+                    f"Global synchronization completed (sync #{sync_count}) at step {global_step}"
+                )
 
         global_step += 1
 
@@ -524,12 +528,12 @@ def main(
         if jax.process_index() == 0:
             wandb.log(
                 {
-                "Loss": accumulated_metrics["loss"],
-                "step": global_step,
-                "lr": current_lr,  
-                "Perplexity": accumulated_metrics["perplexity"],
-                "effective_step": global_step * jax.process_count(),
-                "total_samples": global_step * batch_size 
+                    "Loss": accumulated_metrics["loss"],
+                    "step": global_step,
+                    "lr": current_lr,
+                    "Perplexity": accumulated_metrics["perplexity"],
+                    "effective_step": global_step * jax.process_count(),
+                    "total_samples": global_step * batch_size,
                 }
             )
 

@@ -6,7 +6,8 @@ import flax.linen as nn
 import numpy as np
 import optax
 from flax.training import train_state
-from flax.training.common_utils import shard_prng_key
+from flax.training.common_utils import shard_prng_key, shard
+from functools import partial
 from cyclopts import App
 from datasets import load_dataset
 from transformers import (
@@ -89,9 +90,8 @@ def create_padding_mask(targets):
     return jnp.where(targets > 0, 1.0, 0.0)
 
 
-@jax.jit
-def train_step(state, batch, dropout_rng):
-    """Train for a single step."""
+def train_step_single_device(state, batch, dropout_rng):
+    """Train for a single step on a single device."""
     dropout_rng = jax.random.fold_in(dropout_rng, state.step)
 
     def loss_fn(params):
@@ -120,19 +120,37 @@ def train_step(state, batch, dropout_rng):
     grads = jax.tree_map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
 
     # Update state with gradients
+
+
+    return grads, metrics, dropout_rng
+
+
+@partial(jax.pmap, axis_name="batch", donate_argnums=(0,))
+def train_step(state, batch, dropout_rng):
+    """Train for a single step across multiple devices."""
+    grads, metrics, dropout_rng = train_step_single_device(state, batch, dropout_rng)
+    
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    
     new_state = state.apply_gradients(grads=grads)
+    # All-reduce metrics across devices
+    metrics = jax.lax.pmean(metrics, axis_name="batch")
 
     return new_state, metrics, dropout_rng
 
 
-def prepare_batch_for_jax(batch, device):
-    """Convert a batch of PyTorch tensors to JAX arrays."""
+def prepare_batch_for_jax(batch, devices=None):
+    """Convert a batch of PyTorch tensors to JAX arrays and shard across devices."""
     jax_batch = {}
     for k, v in batch.items():
         if isinstance(v, np.ndarray):
             jax_batch[k] = jnp.array(v)
         else:
             jax_batch[k] = jnp.array(v.numpy())
+
+    # If devices are provided, shard the batch across them
+    if devices is not None:
+        jax_batch = shard(jax_batch)
 
     return jax_batch
 
@@ -148,16 +166,32 @@ def main(
     lr: float = 4e-4,
     weight_decay: float = 0.1,
 ):
-    # Calculate gradient accumulation steps
-    gradient_accumulation_steps = batch_size // per_device_batch_size
+    # Calculate gradient accumulation steps and device batch size
+    num_devices = jax.device_count()
+    device_batch_size = per_device_batch_size
+    total_batch_size = device_batch_size * num_devices
+    gradient_accumulation_steps = batch_size // total_batch_size
+
+    if batch_size % total_batch_size != 0:
+        print(
+            f"Warning: batch_size {batch_size} is not divisible by {total_batch_size} (device_batch_size * num_devices)"
+        )
+        batch_size = gradient_accumulation_steps * total_batch_size
+        print(f"Adjusting batch_size to {batch_size}")
 
     # Print device info
-    print(f"Number of devices: {jax.device_count()}")
+    print(f"Number of devices: {num_devices}")
     print(f"Device type: {jax.devices()[0].platform}")
+    print(f"Per-device batch size: {device_batch_size}")
+    print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
+    print(f"Total batch size: {batch_size}")
 
     # Initialize random keys
     rng = jax.random.PRNGKey(0)
     rng, dropout_rng, init_rng = jax.random.split(rng, 3)
+
+    # Create a separate dropout key for each device
+    dropout_rng = jax.random.split(dropout_rng, num_devices)
 
     # Load model configuration
     config = LlamaConfig.from_pretrained(pretrained_model_name_or_path=config_path)
@@ -165,7 +199,7 @@ def main(
     # Initialize model
     model = FlaxLlamaForCausalLM(config)
     print(
-        f"Model loaded with {sum(np.prod(p.shape) for p in jax.tree_util.tree_map(model.params)):,} parameters"
+        f"Model loaded with {sum(np.prod(p.shape) for p in jax.tree_util.tree_leaves(model.params)):,} parameters"
     )
 
     # Setup learning rate scheduler
@@ -181,8 +215,9 @@ def main(
         beta2=0.95,
     )
 
-    # Create training state
+    # Create training state and replicate across devices
     state = create_train_state(model, optimizer)
+    state = flax.jax_utils.replicate(state)
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
@@ -207,21 +242,37 @@ def main(
     # Setup data collator
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-    # Create data iterator
+    # Create data iterator that produces batches for all devices
     def data_generator():
         train_dataset = tokenized_datasets["train"]
         indices = np.random.permutation(len(train_dataset))
-        
-        batch_indices = [
-            indices[i : i + per_device_batch_size]
-            for i in range(0, len(indices), per_device_batch_size)
-        ]
 
-        for batch_idx in batch_indices:
-            batch = [train_dataset[int(idx)] for idx in batch_idx]
-            batch = data_collator(batch)
-            jax_batch = prepare_batch_for_jax(batch, device=None)
-            yield jax_batch
+        # Create batches for all devices
+        # Each global batch needs to have (device_batch_size * num_devices) examples
+        global_batch_size = device_batch_size * num_devices
+
+        for i in range(0, len(indices), global_batch_size):
+            if i + global_batch_size > len(indices):
+                # Skip incomplete batches at the end
+                continue
+
+            batch_indices = indices[i : i + global_batch_size]
+            examples = [train_dataset[int(idx)] for idx in batch_indices]
+            batch = data_collator(examples)
+
+            # Reshape batch to match device count
+            for k, v in batch.items():
+                if isinstance(v, np.ndarray):
+                    # Reshape (global_batch_size, ...) -> (num_devices, device_batch_size, ...)
+                    batch[k] = v.reshape(num_devices, device_batch_size, *v.shape[1:])
+                else:
+                    # Convert PyTorch tensor to numpy and reshape
+                    array = v.numpy()
+                    batch[k] = array.reshape(
+                        num_devices, device_batch_size, *array.shape[1:]
+                    )
+
+            yield batch
 
     train_iter = data_generator()
 
@@ -240,7 +291,15 @@ def main(
                 train_iter = data_generator()
                 batch = next(train_iter)
 
-            state, metrics, dropout_rng = train_step(state, batch, dropout_rng)
+            # No need to prepare_batch_for_jax as our data generator already provides the right shapes
+            # We just need to create JAX arrays
+            jax_batch = {k: jnp.array(v) for k, v in batch.items()}
+
+            # Train step across all devices
+            state, metrics, dropout_rng = train_step(state, jax_batch, dropout_rng)
+
+            # Extract metrics from first device (they're the same across all devices due to pmean)
+            metrics = {k: float(v[0]) for k, v in metrics.items()}
 
             # Accumulate metrics
             for key in accumulated_metrics:
@@ -249,7 +308,8 @@ def main(
         global_step += 1
 
         # Log metrics
-        current_lr = lr_schedule(state.step)
+        # Get current learning rate from first device
+        current_lr = lr_schedule(int(jax.device_get(state.step[0])))
         print(
             f"Step: {global_step}, "
             f"Loss: {accumulated_metrics['loss']:.4f}, "
@@ -262,8 +322,8 @@ def main(
 
         # Save checkpoint periodically
         if global_step % 1000 == 0:
-            # Save model checkpoint
-            params = jax.device_get(jax.tree_map(lambda x: x[0], state.params))
+            # Save model checkpoint - unreplicate from first device
+            params = jax.device_get(flax.jax_utils.unreplicate(state).params)
             model_output_dir = f"./checkpoints/step_{global_step}"
             os.makedirs(model_output_dir, exist_ok=True)
             model.save_pretrained(model_output_dir, params=params)
@@ -272,8 +332,8 @@ def main(
 
     print("Training completed.")
 
-    # Save final model
-    params = jax.device_get(jax.tree_map(lambda x: x[0], state.params))
+    # Save final model - unreplicate from first device
+    params = jax.device_get(flax.jax_utils.unreplicate(state).params)
     model_output_dir = "./checkpoints/final"
     os.makedirs(model_output_dir, exist_ok=True)
     model.save_pretrained(model_output_dir, params=params)

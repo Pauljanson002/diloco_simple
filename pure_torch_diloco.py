@@ -71,10 +71,20 @@ def main(
     )
     outer_optimizer = torch.optim.SGD(
         model.parameters(), lr=outer_lr, momentum=0.9, nesterov=True
-    )
+    ) 
 
     params_offloaded = get_offloaded_param(outer_optimizer)
-
+    # Print training configuration
+    if local_rank == 0:
+        print(f"Training configuration:")
+        print(f"  Total steps: {total_steps}")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Per device batch size: {per_device_train_batch_size}")
+        print(f"  Gradient accumulation steps: {gradient_accumulation_steps}")
+        print(f"  Local steps (outer loop): {local_steps}")
+        print(f"  Learning rate (inner): {lr}")
+        print(f"  Learning rate (outer): {outer_lr}")
+        print(f"  World size: {world_size}")
     scheduler = get_cosine_schedule_with_warmup(
         inner_optimizer,
         num_warmup_steps=warmup_steps,

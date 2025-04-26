@@ -17,7 +17,6 @@ from transformers import (
     LlamaConfig,
     DataCollatorForLanguageModeling,
 )
-import wandb
 
 app = App()
 
@@ -76,18 +75,10 @@ class LowCommTrainState(train_state.TrainState):
     )  # Mark as static
     inner_steps_counter: int
     inner_steps_max: int
-    accumulated_grads: flax.core.FrozenDict = None  # Store accumulated gradients
-    gradient_acc_step: int = 0  # Current grad accumulation step
-    gradient_acc_steps: int = 1  # Total grad accumulation steps
 
 
 def create_low_comm_train_state(
-    model,
-    inner_optimizer,
-    outer_optimizer,
-    inner_steps_max,
-    gradient_acc_steps=1,
-    params=None,
+    model, inner_optimizer, outer_optimizer, inner_steps_max, params=None
 ):
     """Creates initial `LowCommTrainState` for model with inner and outer optimizers."""
     if params is None:
@@ -96,6 +87,8 @@ def create_low_comm_train_state(
     # Initialize outer optimizer state
     outer_opt_state = outer_optimizer.init(params)
 
+    print(type(outer_opt_state))
+    print(type(outer_optimizer))
     # Initialize with both params the same
     return LowCommTrainState.create(
         apply_fn=model.__call__,
@@ -106,9 +99,6 @@ def create_low_comm_train_state(
         outer_tx=outer_optimizer,  # Store outer optimizer
         inner_steps_counter=0,  # Counter for inner optimization steps
         inner_steps_max=inner_steps_max,  # Max steps before sync
-        accumulated_grads=None,  # Initialize accumulated gradients as None
-        gradient_acc_step=0,  # Initialize gradient accumulation step counter
-        gradient_acc_steps=gradient_acc_steps,  # Set total gradient accumulation steps
     )
 
 
@@ -165,103 +155,24 @@ def train_step_single_device(state, batch, dropout_rng):
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (_, metrics), grads = grad_fn(state.params)
 
-    # grads = jax.tree_map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
+    # Clip gradients by global norm
+    grads = jax.tree_map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
 
-    # Accumulate gradients using jax.lax.cond for traceability
-    def initialize_grads(unused):
-        return grads
+    # Update state with gradients (without pmean synchronization)
+    new_state = state.apply_gradients(grads=grads)
 
-    def add_to_existing_grads(existing_grads):
-        # Handle the case where existing_grads is None
-        return jax.tree_map(
-            lambda acc, g: g if acc is None else acc + g,
-            existing_grads, 
-            grads,
-            is_leaf=lambda x: x is None
-        )
-
-    accumulated_grads = jax.lax.cond(
-        state.gradient_acc_step == 0,
-        initialize_grads,
-        add_to_existing_grads,
-        state.accumulated_grads
-    )
-
-    # Increment gradient accumulation step
-    gradient_acc_step = state.gradient_acc_step + 1
-
-    # Check if we've accumulated enough gradients
-    apply_grads = gradient_acc_step >= state.gradient_acc_steps
-
-    # Define the branch where we apply gradients
-    def apply_gradients_branch(args):
-        state, accumulated_grads, gradient_acc_step = args
-
-        # Normalize the accumulated gradients
-        normalized_grads = jax.tree_map(
-            lambda g: g / state.gradient_acc_steps, accumulated_grads
-        )
-        # Clip gradients by global norm
-        clip_threshold = 1.0  # We can make this a parameter if needed
-
-        # Calculate global norm
-        sq_sum = sum(
-            jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(normalized_grads)
-        )
-        global_norm = jnp.sqrt(sq_sum)
-
-        # Calculate the scaling factor for clipping
-        scale = jnp.minimum(1.0, clip_threshold / (global_norm + 1e-6))
-
-        # Apply scaling to all gradients
-        clipped_grads = jax.tree_map(lambda g: g * scale, normalized_grads)
-
-        # Apply the normalized gradients to update the model
-        new_state = state.apply_gradients(grads=clipped_grads)
-
-        # Increment the inner steps counter (each grad acc cycle counts as one step)
-        inner_steps_counter = state.inner_steps_counter + 1
-
-        # Initialize empty gradients with same structure (zeros) instead of None
-        empty_grads = jax.tree_map(lambda x: jnp.zeros_like(x), accumulated_grads)
-
-        # Reset gradient accumulation
-        return new_state.replace(
-            gradient_acc_step=0,
-            accumulated_grads=empty_grads,  # Use empty grads instead of None
-            inner_steps_counter=inner_steps_counter,
-        )
-
-    # Define the branch where we just accumulate gradients
-    def accumulate_gradients_branch(args):
-        state, accumulated_grads, gradient_acc_step = args
-
-        # Update accumulated_grads and gradient_acc_step
-        return state.replace(
-            accumulated_grads=accumulated_grads, gradient_acc_step=gradient_acc_step
-        )
-
-    # Use JAX's conditional to decide whether to apply gradients
-    new_state = jax.lax.cond(
-        apply_grads,
-        apply_gradients_branch,
-        accumulate_gradients_branch,
-        (state, accumulated_grads, gradient_acc_step),
-    )
+    # Increment the inner steps counter
+    new_inner_steps_counter = state.inner_steps_counter + 1
 
     # Check if we need to synchronize with global parameters
-    # Only check after applying gradients (when gradient accumulation is complete)
-    needs_sync = jnp.logical_and(
-        new_state.gradient_acc_step == 0,
-        new_state.inner_steps_counter >= new_state.inner_steps_max
-    )
+    needs_sync = new_inner_steps_counter >= state.inner_steps_max
 
     # Define the two branches for JAX's conditional
     def sync_branch(args):
         new_state, state = args
         # Calculate parameter differences between current and last global sync
         param_diff = jax.tree_map(
-            lambda inner, outer: outer - inner, new_state.params, state.outer_params
+            lambda inner, outer: inner - outer, new_state.params, state.outer_params
         )
 
         # Use pmean to average the parameter differences across devices
@@ -285,8 +196,8 @@ def train_step_single_device(state, batch, dropout_rng):
 
     def no_sync_branch(args):
         new_state, _ = args
-        # No sync needed
-        return new_state
+        # Just update the counter if no sync is needed
+        return new_state.replace(inner_steps_counter=new_inner_steps_counter)
 
     # Use JAX's conditional instead of Python if
     new_state = jax.lax.cond(
@@ -331,16 +242,16 @@ def prepare_batch_for_jax(batch, devices=None):
 
 @app.default
 def main(
-    batch_size: int = 512,
-    per_device_batch_size: int = 16,
+    batch_size: int = 128,
+    per_device_batch_size: int = 64,
     seq_length: int = 1024,
-    warmup_steps: int = 50,
+    warmup_steps: int = 1000,
     total_steps: int = 88_000,
     config_path: str = "config_14m.json",
-    lr: float = 1e-3,
+    lr: float = 4e-4,
     weight_decay: float = 0.1,
     inner_steps: int = 10,  # Number of inner steps before synchronization
-    outer_lr: float = 0.7,  # Learning rate for outer optimizer
+    outer_lr: float = 1e-3,  # Learning rate for outer optimizer
     outer_momentum: float = 0.9,  # Momentum for outer optimizer
 ):
     # Calculate gradient accumulation steps and device batch size
@@ -363,9 +274,6 @@ def main(
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     print(f"Total batch size: {batch_size}")
     print(f"Inner steps before synchronization: {inner_steps}")
-    
-    if jax.process_index() == 0:
-        wandb.init(project="diloco", config=locals())
 
     # Initialize random keys
     rng = jax.random.PRNGKey(0)
@@ -404,14 +312,14 @@ def main(
     )
 
     outer_optimizer = create_sgd_optimizer(
-        learning_rate_schedule=outer_lr,
+        learning_rate_schedule=outer_lr_schedule,
         momentum=outer_momentum,
         nesterov=True,
     )
 
     # Create training state and replicate across devices
     state = create_low_comm_train_state(
-        model, inner_optimizer, outer_optimizer, inner_steps,gradient_acc_steps=gradient_accumulation_steps
+        model, inner_optimizer, outer_optimizer, inner_steps
     )
     state = flax.jax_utils.replicate(state)
 
@@ -508,7 +416,9 @@ def main(
             # Only print sync message from the first device (host_id 0)
             if did_sync.all() and jax.process_index() == 0:
                 sync_count += 1
-                print(f"Global synchronization completed (sync #{sync_count}) at step {global_step}")
+                print(
+                    f"Global synchronization completed (sync #{sync_count}) at step {global_step}"
+                )
 
         global_step += 1
 
@@ -521,17 +431,6 @@ def main(
             f"Perplexity: {accumulated_metrics['perplexity']:.2f}, "
             f"LR: {current_lr:.6f}"
         )
-        if jax.process_index() == 0:
-            wandb.log(
-                {
-                "Loss": accumulated_metrics["loss"],
-                "step": global_step,
-                "lr": current_lr,  
-                "Perplexity": accumulated_metrics["perplexity"],
-                "effective_step": global_step * jax.process_count(),
-                "total_samples": global_step * batch_size 
-                }
-            )
 
         # Reset accumulated metrics
         accumulated_metrics = {"loss": 0.0, "perplexity": 0.0}
@@ -555,7 +454,6 @@ def main(
     model.save_pretrained(model_output_dir, params=params)
     tokenizer.save_pretrained(model_output_dir)
     print(f"Saved final model to {model_output_dir}")
-    wandb.finish()
 
 
 if __name__ == "__main__":
